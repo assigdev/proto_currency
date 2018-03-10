@@ -6,7 +6,7 @@ Otus homework project
 
 clone repository:
 
-    $ git clone https://github.com/assigdev/proto_memcash_loader
+    $ git clone https://github.com/assigdev/proto_currency.git
     
     pipenv install
     
