@@ -21,6 +21,7 @@ THREADS_COUNT = 3
 WORKERS_COUNT = 4
 MEMC_TIMEOUT = 5
 PORTION_SIZE = 10
+RETRY_COUNT = 4
 PATTERN = "/data/appsinstalled/*.tsv.gz"
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
 
@@ -36,17 +37,20 @@ class ThreadInsert(threading.Thread):
 
     def run(self):
         while True:
-            for args in self.queue.get():
-                memc_addr, appsinstalled, dev_type, dry_run = args
-                connection = self.connections[dev_type]
-                ok = insert_appsinstalled(memc_addr, appsinstalled, connection, dry_run)
-                if ok:
-                    self.processed += 1
-                else:
-                    self.errors += 1
-            self.queue.task_done()
-            if self.queue.empty():
+            out = self.queue.get()
+            if out == 'Done':
+                self.queue.task_done()
                 self.out_queue.put((self.processed, self.errors))
+            else:
+                for args in out:
+                    appsinstalled, packed, ua, retry_count, dry_run = args
+                    connection = self.connections[appsinstalled.dev_type]
+                    ok = insert_appsinstalled(connection, appsinstalled, packed, ua, retry_count, dry_run)
+                    if ok:
+                        self.processed += 1
+                    else:
+                        self.errors += 1
+                self.queue.task_done()
 
 
 def dot_rename(path):
@@ -62,19 +66,30 @@ def create_memcache_connections(device_memc, memc_timeout):
     return memcache_connections
 
 
-def insert_appsinstalled(memc_addr, appsinstalled, connection, dry_run=False):
+def serialize_data(appsinstalled):
     ua = appsinstalled_pb2.UserApps()
     ua.lat = appsinstalled.lat
     ua.lon = appsinstalled.lon
-    key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
     ua.apps.extend(appsinstalled.apps)
     packed = ua.SerializeToString()
+    return packed, ua
+
+
+def insert_appsinstalled(connection, appsinstalled, ua, packed, retry_count, dry_run=False):
+    key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
+    address = connection.buckets[0].address
+    memc_addr = "{0}:{1}".format(address[0], address[1])
     try:
         if dry_run:
             logging.debug("%s - %s -> %s" % (memc_addr, key, str(ua).replace("\n", " ")))
         else:
             result = connection.set(key, packed)
-            if result is 0:
+            if result == 0:
+                for i in range(retry_count):
+                    result = connection.set(key, packed)
+                    if result:
+                        break
+            if result == 0:
                 logging.error("Cannot set data to memc %s" % (memc_addr,))
     except Exception, e:
         logging.exception("Cannot write to memc %s: %s" % (memc_addr, e))
@@ -129,12 +144,14 @@ def worker(args):
             errors += 1
             logging.error("Unknown device type: %s" % appsinstalled.dev_type)
             continue
-        args_portion.append((memc_addr, appsinstalled, appsinstalled.dev_type, options.dry))
+        packed, ua = serialize_data(appsinstalled)
+        args_portion.append((appsinstalled, packed, ua, options.retry_count, options.dry))
         if len(args_portion) == options.portion_size:
             in_queue.put(args_portion)
             args_portion = []
     if len(args_portion):
         in_queue.put(args_portion)
+    in_queue.put('Done')
     in_queue.join()
 
     while not out_queue.empty():
@@ -146,7 +163,7 @@ def worker(args):
     out_queue.join()
     if not processed:
         fd.close()
-        return
+        return filename
 
     err_rate = float(errors) / processed
     if err_rate < NORMAL_ERR_RATE:
@@ -155,6 +172,7 @@ def worker(args):
         logging.error("High error rate (%s > %s). Failed load" % (err_rate, NORMAL_ERR_RATE))
     fd.close()
     logging.info("Worker with {0} End at {1}".format(fd.filename, time.time() - start))
+    return filename
 
 
 def main(options):
@@ -168,8 +186,7 @@ def main(options):
     filename_list = sorted([fn for fn in glob.iglob(options.pattern)])
     args_list = [(filename, options, device_memc) for filename in filename_list]
 
-    pool.map(worker, args_list)
-    for filename in filename_list:
+    for filename in pool.imap(worker, args_list):
         dot_rename(filename)
 
 
@@ -202,6 +219,12 @@ if __name__ == '__main__':
     op.add_option("-w", "--workers_count", action="store", default=WORKERS_COUNT, type='int', help='count of workers')
     op.add_option("--threads_count", action="store", default=THREADS_COUNT, type='int', help='count of threads')
     op.add_option("--portion_size", action="store", default=PORTION_SIZE, type='int', help='portion size for queue')
+    op.add_option(
+        "--retry_count",
+        action="store",
+        default=RETRY_COUNT,
+        type='int',
+        help='count of retry set data in memcache')
     op.add_option(
         "--memc_timeout",
         action="store",
