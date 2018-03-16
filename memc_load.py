@@ -85,7 +85,7 @@ def insert_appsinstalled(connection, appsinstalled, ua, packed, retry_count, dry
         else:
             result = connection.set(key, packed)
             if result == 0:
-                for i in range(retry_count):
+                for _ in range(retry_count):
                     result = connection.set(key, packed)
                     if result:
                         break
@@ -123,7 +123,7 @@ def worker(args):
     filename, options, device_memc = args
 
     connections = create_memcache_connections(device_memc, options.memc_timeout)
-    for i in range(options.threads_count):
+    for _ in range(options.threads_count):
         t = ThreadInsert(in_queue, out_queue, connections)
         t.setDaemon(True)
         t.start()
