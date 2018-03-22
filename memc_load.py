@@ -22,7 +22,7 @@ WORKERS_COUNT = 4
 MEMC_TIMEOUT = 5
 PORTION_SIZE = 10
 RETRY_COUNT = 4
-PATTERN = "/home/assig/pysrc/otus/12_concurrency/concurrency/data2/*.tsv.gz" #"/data/appsinstalled/*.tsv.gz"
+PATTERN = "/data/appsinstalled/*.tsv.gz"
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
 
 
