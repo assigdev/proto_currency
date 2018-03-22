@@ -22,16 +22,19 @@ WORKERS_COUNT = 4
 MEMC_TIMEOUT = 5
 PORTION_SIZE = 10
 RETRY_COUNT = 4
-PATTERN = "/data/appsinstalled/*.tsv.gz"
+PATTERN = "/home/assig/pysrc/otus/12_concurrency/concurrency/data2/*.tsv.gz" #"/data/appsinstalled/*.tsv.gz"
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
 
 
 class ThreadInsert(threading.Thread):
-    def __init__(self, queue, out_queue, connections):
+    def __init__(self, queue, out_queue, connection, retry_count, dry):
         threading.Thread.__init__(self)
         self.queue = queue
         self.out_queue = out_queue
-        self.connections = connections
+        self.connection = connection
+        self.retry_count = retry_count
+        self.dry = dry
+        self.memc_addr = self.get_memc_addr()
         self.processed = 0
         self.errors = 0
 
@@ -42,59 +45,56 @@ class ThreadInsert(threading.Thread):
                 self.queue.task_done()
                 self.out_queue.put((self.processed, self.errors))
             else:
-                for args in out:
-                    appsinstalled, packed, ua, retry_count, dry_run = args
-                    connection = self.connections[appsinstalled.dev_type]
-                    ok = insert_appsinstalled(connection, appsinstalled, packed, ua, retry_count, dry_run)
-                    if ok:
-                        self.processed += 1
-                    else:
-                        self.errors += 1
+
+                processed, errors = self.insert_appsinstalled(out)
+                self.processed += processed
+                self.errors += errors
                 self.queue.task_done()
 
+    def get_memc_addr(self):
+        address = self.connection.buckets[0].address
+        return "{0}:{1}".format(address[0], address[1])
 
-def dot_rename(path):
-    head, fn = os.path.split(path)
-    # atomic in most cases
-    os.rename(path, os.path.join(head, "." + fn))
+    def insert_appsinstalled(self,  out):
+        processed = 0
+        errors = 0
+        items = {}
+        memc_addr_list = []
+        for args in out:
+            appsinstalled, packed, ua = args
+            key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
+            memc_addr_list.append(self.memc_addr)
+            if self.dry:
+                logging.debug("%s - %s -> %s" % (self.memc_addr, key, str(ua).replace("\n", " ")))
+                processed += 1
+            else:
+                items[key] = packed
+        if not self.dry:
+            try:
+                result = self.connection.set_multu(items)
+            except Exception, e:
+                result = 0
 
-
-def create_memcache_connections(device_memc, memc_timeout):
-    memcache_connections = {}
-    for key, value in device_memc.items():
-        memcache_connections[key] = memcache.Client([value], socket_timeout=memc_timeout)
-    return memcache_connections
-
-
-def serialize_data(appsinstalled):
-    ua = appsinstalled_pb2.UserApps()
-    ua.lat = appsinstalled.lat
-    ua.lon = appsinstalled.lon
-    ua.apps.extend(appsinstalled.apps)
-    packed = ua.SerializeToString()
-    return packed, ua
-
-
-def insert_appsinstalled(connection, appsinstalled, ua, packed, retry_count, dry_run=False):
-    key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
-    address = connection.buckets[0].address
-    memc_addr = "{0}:{1}".format(address[0], address[1])
-    try:
-        if dry_run:
-            logging.debug("%s - %s -> %s" % (memc_addr, key, str(ua).replace("\n", " ")))
-        else:
-            result = connection.set(key, packed)
             if result == 0:
-                for _ in range(retry_count):
-                    result = connection.set(key, packed)
-                    if result:
-                        break
-            if result == 0:
-                logging.error("Cannot set data to memc %s" % (memc_addr,))
-    except Exception, e:
-        logging.exception("Cannot write to memc %s: %s" % (memc_addr, e))
-        return False
-    return True
+                for i, key in enumerate(items):
+                    try:
+                        result = self.connection.set(key, items[key])
+                        if result == 0:
+                            for _ in range(self.retry_count):
+                                result = self.connection.set(key, items[key])
+                                if result:
+                                    break
+                        if result == 0:
+                            logging.error("Cannot set data to memc %s" % (self.memc_addr,))
+                            errors += 1
+                        else:
+                            processed += 1
+                    except Exception, e:
+                        logging.exception("Cannot write to memc %s: %s" % (self.memc_addr, e))
+                        errors += 1
+            else:
+                processed += len(items)
+        return processed, errors
 
 
 def parse_appsinstalled(line):
@@ -117,14 +117,18 @@ def parse_appsinstalled(line):
 
 
 def worker(args):
-    in_queue = Queue.Queue()
+    in_queues = {}
+    args_portions = {}
     out_queue = Queue.Queue()
     start = time.time()
     filename, options, device_memc = args
 
     connections = create_memcache_connections(device_memc, options.memc_timeout)
-    for _ in range(options.threads_count):
-        t = ThreadInsert(in_queue, out_queue, connections)
+    for key, connection in connections.items():
+        in_queue = Queue.Queue()
+        in_queues[key] = in_queue
+        args_portions[key] = []
+        t = ThreadInsert(in_queue, out_queue, connection, options.retry_count, options.dry)
         t.setDaemon(True)
         t.start()
     processed = errors = 0
@@ -139,20 +143,23 @@ def worker(args):
         if not appsinstalled:
             errors += 1
             continue
-        memc_addr = device_memc.get(appsinstalled.dev_type)
+        dev_type = appsinstalled.dev_type
+        memc_addr = device_memc.get(dev_type)
         if not memc_addr:
             errors += 1
             logging.error("Unknown device type: %s" % appsinstalled.dev_type)
             continue
         packed, ua = serialize_data(appsinstalled)
-        args_portion.append((appsinstalled, packed, ua, options.retry_count, options.dry))
-        if len(args_portion) == options.portion_size:
+        args_portions[dev_type].append((appsinstalled, packed, ua))
+
+        if len(args_portions[dev_type]) == options.portion_size:
+            in_queues[dev_type].put(args_portions[dev_type])
+            args_portions[dev_type] = []
+    for in_queue in in_queues.values():
+        if len(args_portion):
             in_queue.put(args_portion)
-            args_portion = []
-    if len(args_portion):
-        in_queue.put(args_portion)
-    in_queue.put('Done')
-    in_queue.join()
+        in_queue.put('Done')
+        in_queue.join()
 
     while not out_queue.empty():
         processed_chunk, errors_chunk = out_queue.get()
@@ -173,6 +180,28 @@ def worker(args):
     fd.close()
     logging.info("Worker with {0} End at {1}".format(fd.filename, time.time() - start))
     return filename
+
+
+def dot_rename(path):
+    head, fn = os.path.split(path)
+    # atomic in most cases
+    os.rename(path, os.path.join(head, "." + fn))
+
+
+def create_memcache_connections(device_memc, memc_timeout):
+    memcache_connections = {}
+    for key, value in device_memc.items():
+        memcache_connections[key] = memcache.Client([value], socket_timeout=memc_timeout)
+    return memcache_connections
+
+
+def serialize_data(appsinstalled):
+    ua = appsinstalled_pb2.UserApps()
+    ua.lat = appsinstalled.lat
+    ua.lon = appsinstalled.lon
+    ua.apps.extend(appsinstalled.apps)
+    packed = ua.SerializeToString()
+    return packed, ua
 
 
 def main(options):
@@ -217,7 +246,6 @@ if __name__ == '__main__':
     op.add_option("--adid", action="store", default="127.0.0.1:33015", help='memcash  ip:port for android adid')
     op.add_option("--dvid", action="store", default="127.0.0.1:33016", help='memcash  ip:port for android dvid')
     op.add_option("-w", "--workers_count", action="store", default=WORKERS_COUNT, type='int', help='count of workers')
-    op.add_option("--threads_count", action="store", default=THREADS_COUNT, type='int', help='count of threads')
     op.add_option("--portion_size", action="store", default=PORTION_SIZE, type='int', help='portion size for queue')
     op.add_option(
         "--retry_count",
