@@ -76,24 +76,27 @@ class ThreadInsert(threading.Thread):
                 result = 0
 
             if result == 0:
-                for i, key in enumerate(items):
-                    try:
-                        result = self.connection.set(key, items[key])
-                        if result == 0:
-                            for _ in range(self.retry_count):
-                                result = self.connection.set(key, items[key])
-                                if result:
-                                    break
-                        if result == 0:
-                            logging.error("Cannot set data to memc %s" % (self.memc_addr,))
-                            errors += 1
-                        else:
-                            processed += 1
-                    except Exception, e:
-                        logging.exception("Cannot write to memc %s: %s" % (self.memc_addr, e))
-                        errors += 1
+                processed, errors = self.set_items(items)
             else:
                 processed += len(items)
+        return processed, errors
+
+    def set_items(self, items):
+        processed = errors = 0
+        result = connect_num = 0
+        for i, key in enumerate(items):
+            try:
+                while result == 0 and connect_num < self.retry_count:
+                    result = self.connection.set(key, items[key])
+                    connect_num += 1
+                if result == 0:
+                    logging.error("Cannot set data to memc %s" % (self.memc_addr,))
+                    errors += 1
+                else:
+                    processed += 1
+            except Exception, e:
+                logging.exception("Cannot write to memc %s: %s" % (self.memc_addr, e))
+                errors += 1
         return processed, errors
 
 
