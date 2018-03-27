@@ -58,12 +58,11 @@ class ThreadInsert(threading.Thread):
     def insert_appsinstalled(self,  out):
         processed = 0
         errors = 0
+        result = []
         items = {}
-        memc_addr_list = []
         for args in out:
             appsinstalled, packed, ua = args
             key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
-            memc_addr_list.append(self.memc_addr)
             if self.dry:
                 logging.debug("%s - %s -> %s" % (self.memc_addr, key, str(ua).replace("\n", " ")))
                 processed += 1
@@ -71,32 +70,21 @@ class ThreadInsert(threading.Thread):
                 items[key] = packed
         if not self.dry:
             try:
-                result = self.connection.set_multu(items)
-            except Exception, e:
-                result = 0
+                connect_num = 0
+                while result != [] and connect_num < self.retry_count:
+                    result = self.connection.set_multi(items)
+                    connect_num += 1
+            except ValueError, e:
+                logging.exception("Cannot write to memc %s: %s" % (self.memc_addr, e))
+                result = len(items)
 
-            if result == 0:
-                processed, errors = self.set_items(items)
+            if len(result) > 0:
+                for key in result:
+                    logging.error("Cannot set data to memc %s key: %s" % (self.memc_addr, key))
+                errors += len(result)
+                processed += len(items) - len(result)
             else:
                 processed += len(items)
-        return processed, errors
-
-    def set_items(self, items):
-        processed = errors = 0
-        result = connect_num = 0
-        for i, key in enumerate(items):
-            try:
-                while result == 0 and connect_num < self.retry_count:
-                    result = self.connection.set(key, items[key])
-                    connect_num += 1
-                if result == 0:
-                    logging.error("Cannot set data to memc %s" % (self.memc_addr,))
-                    errors += 1
-                else:
-                    processed += 1
-            except Exception, e:
-                logging.exception("Cannot write to memc %s: %s" % (self.memc_addr, e))
-                errors += 1
         return processed, errors
 
 
