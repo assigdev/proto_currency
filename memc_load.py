@@ -22,7 +22,7 @@ WORKERS_COUNT = 4
 MEMC_TIMEOUT = 5
 PORTION_SIZE = 10
 RETRY_COUNT = 4
-PATTERN = "/data/appsinstalled/*.tsv.gz"
+PATTERN = "/home/assig/pysrc/otus/12_concurrency/concurrency/data2/*.tsv.gz"
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
 
 
@@ -71,7 +71,7 @@ class ThreadInsert(threading.Thread):
                 items[key] = packed
         if not self.dry:
             try:
-                result = self.connection.set_multu(items)
+                result = self.connection.set_multi(items)
             except Exception, e:
                 result = 0
 
